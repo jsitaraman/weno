@@ -1,5 +1,9 @@
 import sys
 import numpy as np
+try:
+    import cupy as cp
+except ImportError:
+    cp = None    
 import matplotlib.pyplot as plt
 import argparse
 # implement weno5 scheme from Chi-Wang Shu paper
@@ -9,13 +13,21 @@ import argparse
 # perform checks for isentropic vortex on a wavy grid
 # and ensure 5th order accuracy
 #
+def get_xp(arr):
+    return cp if (cp is not None and isinstance(arr, cp.ndarray)) else np
+
+def xp_from(arr):
+    if cp is not None and isinstance(arr, cp.ndarray):
+        return cp
+    return np
+
 def weno5_fd_2d(F, js, je, axis=1):
     """
     5th-order FD-WENO reconstruction (left/right) for 3D array along given axis.
     
     Parameters
     ----------
-    F : np.ndarray
+    F : xp.ndarray
         3D array of cell-centered values (nfields, nx, ny)
     js, je : int
         Interior indices for reconstruction
@@ -26,15 +38,16 @@ def weno5_fd_2d(F, js, je, axis=1):
     
     Returns
     -------
-    FL, FR : np.ndarray
+    FL, FR : xp.ndarray
         Left and right reconstructed values at midpoints
     """
-    Fv = np.moveaxis(F, axis, 1)
-    FL = np.zeros_like(Fv)
-    FR = np.zeros_like(Fv)
+    xp = xp_from(F)
+    Fv = xp.moveaxis(F, axis, 1)
+    FL = xp.zeros_like(Fv)
+    FR = xp.zeros_like(Fv)
     nvars, n, m = Fv.shape
     
-    i = np.arange(js-1, je)    
+    i = xp.arange(js-1, je)    
     eps = 1e-6
     
     # Shifted arrays for stencil
@@ -73,8 +86,8 @@ def weno5_fd_2d(F, js, je, axis=1):
     w0, w1, w2 = alpha0/wsum, alpha1/wsum, alpha2/wsum
     FR[:,i, :] = w0*d0 + w1*d1 + w2*d2
     
-    FL = np.moveaxis(FL, 1, axis)
-    FR = np.moveaxis(FR, 1, axis)
+    FL = xp.moveaxis(FL, 1, axis)
+    FR = xp.moveaxis(FR, 1, axis)
     return FL, FR
 
 def linear_weno_2d(X, js, je, axis=1):
@@ -83,7 +96,7 @@ def linear_weno_2d(X, js, je, axis=1):
     
     Parameters
     ----------
-    X : np.ndarray
+    X : xp.ndarray
         2D array of cell-centered values
     js, je : int
         Interior indices for reconstruction
@@ -92,19 +105,20 @@ def linear_weno_2d(X, js, je, axis=1):
     
     Returns
     -------
-    Xint : np.ndarray
+    Xint : xp.ndarray
         2D array of reconstructed midpoints along specifjed axis
     """
     # Move axis to 0 for easjer vectorized indexing
-    Xv = np.moveaxis(X, axis, 0)  # shape (n, m)
-    Xint = np.zeros_like(Xv)
+    xp = xp_from(X)
+    Xv = xp.moveaxis(X, axis, 0)  # shape (n, m)
+    Xint = xp.zeros_like(Xv)
     n, m = Xv.shape
-    i = np.arange(js-2, je+1)
+    i = xp.arange(js-2, je+1)
     # factors to blend forward and backward weno differences
     # because the first and last point cannot do backward and
     # and forward with fringe available, FD fluxes need those
-    fac_f = np.ones_like(i)*0.5
-    fac_b = np.ones_like(i)*0.5
+    fac_f = xp.ones_like(i)*0.5
+    fac_b = xp.ones_like(i)*0.5
     fac_b[0]=0.0;fac_f[0]=1.0
     fac_b[-1]=1.0; fac_f[-1]=0
     # Shifted arrays for WENO stencil (vectorized)
@@ -118,13 +132,13 @@ def linear_weno_2d(X, js, je, axis=1):
     d1 = (-Xm + 5*X0 + 2*Xp)/6.0
     d2 = (2*X0 + 5*Xp - Xpp)/6.0
     w0, w1, w2 = 0.1, 0.6, 0.3
-    Xint[i, :] = fac_b[:,np.newaxis]*(w0*d0 + w1*d1 + w2*d2)
+    Xint[i, :] = fac_b[:,xp.newaxis]*(w0*d0 + w1*d1 + w2*d2)
     d0 = (11*Xp - 7*Xpp + 2*Xppp)/6
     d1 = (2*X0 + 5*Xp - Xpp)/6
     d2 = (-Xm + 5*X0 + 2*Xp)/6
-    Xint[i,:] += fac_f[:,np.newaxis]*(w0*d0 + w1*d1 + w2*d2)
+    Xint[i,:] += fac_f[:,xp.newaxis]*(w0*d0 + w1*d1 + w2*d2)
     # Move axis back and divide by number of contributions
-    Xint = np.moveaxis(Xint, 0, axis)
+    Xint = xp.moveaxis(Xint, 0, axis)
     return Xint
 
 def fd_metrics(x, y, js, je, ks, ke):
@@ -133,20 +147,21 @@ def fd_metrics(x, y, js, je, ks, ke):
 
     Parameters
     ----------
-    x, y : 2D np.ndarray
+    x, y : 2D xp.ndarray
         Physical coordinates of the grid nodes.
     js, je, ks, ke : int
         Start and end indices in j and k directions (Python indexing).
 
     Returns
     -------
-    xi_x, xi_y : 2D np.ndarray
+    xi_x, xi_y : 2D xp.ndarray
         ξ metrics at nodes
-    eta_x, eta_y : 2D np.ndarray
+    eta_x, eta_y : 2D xp.ndarray
         η metrics at nodes
-    area : 2D np.ndarray
+    area : 2D xp.ndarray
         area metrics computed as a Jacobian (not used in residual)
     """
+    xp = xp_from(x)
     n, m = x.shape
     # --- Reconstruct midpoints ---
     xint_xi  = linear_weno_2d(x, js, je, axis=0)
@@ -156,8 +171,8 @@ def fd_metrics(x, y, js, je, ks, ke):
 
     # --- Compute metrics at interior points and one
     # --- extra point on either side to average for interfaces
-    i = np.arange(js-1, je+1)
-    j = np.arange(ks-1, ke+1)
+    i = xp.arange(js-1, je+1)
+    j = xp.arange(ks-1, ke+1)
     
     dx_dxi  = xint_xi[i,ks-1:ke+1] - xint_xi[i-1,ks-1:ke+1]
     dy_dxi  = yint_xi[i,ks-1:ke+1] - yint_xi[i-1,ks-1:ke+1]
@@ -179,7 +194,7 @@ def fv_metrics(x, y, js, je, ks, ke, check_closure=True):
 
     Parameters
     ----------
-    x, y : 2D np.ndarray
+    x, y : 2D xp.ndarray
         Physical coordinates of the grid nodes.
     js, je, ks, ke : int
         Start and end indices in j and k directions (Python indexing).
@@ -190,14 +205,14 @@ def fv_metrics(x, y, js, je, ks, ke, check_closure=True):
 
     Returns
     -------
-    xi_x, xi_y : 2D np.ndarray
+    xi_x, xi_y : 2D xp.ndarray
         ξ-face (East) scaled normals.
-    eta_x, eta_y : 2D np.ndarray
+    eta_x, eta_y : 2D xp.ndarray
         η-face (North) scaled normals.
-    area : 2D np.ndarray
+    area : 2D xp.ndarray
         Cell areas computed consistently with face normals.
     """
-
+    xp = xp_from(x)
     # --- Step 1: reconstruct corner coordinates ---
     nx,ny = x.shape
     x_corner = linear_weno_2d(x, js, je, axis=0)
@@ -260,7 +275,7 @@ def fv_metrics(x, y, js, je, ks, ke, check_closure=True):
         # discrete divergence of face normals should be ~0
         cx = ( xi_x[1:, :] - xi_x[:-1, :] ) + ( eta_x[:, 1:] - eta_x[:, :-1] )
         cy = ( xi_y[1:, :] - xi_y[:-1, :] ) + ( eta_y[:, 1:] - eta_y[:, :-1] )
-        print("Closure check: max |cx| = {:.3e}, max |cy| = {:.3e}".format(np.max(np.abs(cx)), np.max(np.abs(cy))))
+        print("Closure check: max |cx| = {:.3e}, max |cy| = {:.3e}".format(xp.max(xp.abs(cx)), xp.max(xp.abs(cy))))
 
     metrics={ "xi_x" : xi_x, "xi_y" :xi_y, "eta_x" : eta_x, "eta_y" :eta_y, "area" : area}
     return metrics
@@ -269,48 +284,53 @@ def fv_metrics(x, y, js, je, ks, ke, check_closure=True):
 # Flux functions
 # -----------------------------
 def flux_x(U, gamma=1.4):
+    xp = xp_from(U)
     rho = U[0]; u = U[1]/rho; v = U[2]/rho; E = U[3]
     p = (gamma-1)*(E - 0.5*rho*(u**2 + v**2))
-    F = np.array([rho*u, rho*u**2 + p, rho*u*v, (E+p)*u])
+    F = xp.array([rho*u, rho*u**2 + p, rho*u*v, (E+p)*u])
     return F
 
 def flux_y(U, gamma=1.4):
+    xp = xp_from(U)
     rho = U[0]; u = U[1]/rho; v = U[2]/rho; E = U[3]
     p = (gamma-1)*(E - 0.5*rho*(u**2 + v**2))
-    G = np.array([rho*v, rho*u*v, rho*v**2 + p, (E+p)*v])
+    G = xp.array([rho*v, rho*u*v, rho*v**2 + p, (E+p)*v])
     return G
 
 def max_wave_speed(U, gamma=1.4):
+    xp = xp_from(U)
     rho = U[0]; u = U[1]/rho; v = U[2]/rho; E = U[3]
     p = (gamma-1)*(E - 0.5*rho*(u**2 + v**2))
-    c = np.sqrt(gamma*p/rho)
-    return np.max(np.abs(u) + c), np.max(np.abs(v) + c)
+    c = xp.sqrt(gamma*p/rho)
+    return xp.max(xp.abs(u) + c), xp.max(xp.abs(v) + c)
 
 def interface_wave_speed(UL, UR, n_x, n_y, js, je, ks, ke, gamma=1.4, offx=-1, offy=0):
     """
     Compute contravariant Lax-Friedrichs wave speed at interfaces along a given axis.
     Returns
     -------
-    alpha : np.ndarray
+    alpha : xp.ndarray
         Contravariant wave speed at interfaces in the given slice.
     """
     # --- Slice interior interfaces ---
+    xp = xp_from(UL)
     rho_avg = 0.5*(UL[0][js+offx:je, ks+offy:ke] + UR[0][js+offx:je, ks+offy:ke])
     u_avg   = 0.5*(UL[1][js+offx:je, ks+offy:ke] + UR[1][js+offx:je, ks+offy:ke]) / rho_avg
     v_avg   = 0.5*(UL[2][js+offx:je, ks+offy:ke] + UR[2][js+offx:je, ks+offy:ke]) / rho_avg
     E_avg   = 0.5*(UL[3][js+offx:je, ks+offy:ke] + UR[3][js+offx:je, ks+offy:ke])
     # --- Pressure and sound speed ---
     p_avg = (gamma-1)*(E_avg - 0.5*rho_avg*(u_avg**2 + v_avg**2))
-    c = np.sqrt(gamma*p_avg / rho_avg)
+    c = xp.sqrt(gamma*p_avg / rho_avg)
     # --- Contravariant velocity along interface ---
     V = u_avg*n_x + v_avg*n_y
     # --- Metric magnitude ---
-    metric_mag = np.sqrt(n_x**2 + n_y**2)
+    metric_mag = xp.sqrt(n_x**2 + n_y**2)
     # --- Lax-Friedrichs wave speed ---
-    alpha = np.abs(V) + c*metric_mag
+    alpha = xp.abs(V) + c*metric_mag
     return alpha
 
 def reconstruct(U, js, je, gamma=1.4, axis=1):
+    xp = xp_from(U)
     # --- Create Cartesian fluxes
     F = flux_x(U, gamma)  # x-direction flux
     G = flux_y(U, gamma)  # y-direction flux    
@@ -329,9 +349,9 @@ def residual_fv(U, js, je, ks, ke, metrics, gamma=1.4):
     
     Parameters
     ----------
-    U : np.ndarray, shape (4, nx, ny)
+    U : xp.ndarray, shape (4, nx, ny)
         Conserved variables [rho, rho*u, rho*v, E], including ghost cells
-    x, y : np.ndarray, shape (nx, ny)
+    x, y : xp.ndarray, shape (nx, ny)
         Physical coordinates, including ghost cells
     js, je, ks, ke : int
         Interior index ranges
@@ -340,11 +360,12 @@ def residual_fv(U, js, je, ks, ke, metrics, gamma=1.4):
     
     Returns
     -------
-    Res : np.ndarray, shape (4, nx, ny)
+    Res : xp.ndarray, shape (4, nx, ny)
         Residuals at interior cells (ghosts remain 0)
     """
     # init residual
-    Res = np.zeros_like(U)
+    xp = xp_from(U)
+    Res = xp.zeros_like(U)
 
     # fetch metrics
     xi_x = metrics["xi_x"]
@@ -385,9 +406,9 @@ def residual_fd(U, js, je, ks, ke, metrics, gamma=1.4):
     
     Parameters
     ----------
-    U : np.ndarray, shape (4, nx, ny)
+    U : xp.ndarray, shape (4, nx, ny)
         Conserved variables [rho, rho*u, rho*v, E], including ghost cells
-    x, y : np.ndarray, shape (nx, ny)
+    x, y : xp.ndarray, shape (nx, ny)
         Physical coordinates, including ghost cells
     js, je, ks, ke : int
         Interior index ranges
@@ -397,10 +418,11 @@ def residual_fd(U, js, je, ks, ke, metrics, gamma=1.4):
 
     Returns
     -------
-    Res : np.ndarray, shape (4, nx, ny)
+    Res : xp.ndarray, shape (4, nx, ny)
         Residuals at interior cells (ghosts remain 0)
     """
-    Res = np.zeros_like(U)
+    xp = xp_from(U)
+    Res = xp.zeros_like(U)
     # fetch metrics
     xi_x = metrics["xi_x"]
     xi_y = metrics["xi_y"]
@@ -456,13 +478,14 @@ def residual_fd(U, js, je, ks, ke, metrics, gamma=1.4):
 # RK3 time integration
 # -----------------------------
 def rk3_tvd(U0, dt, js, je, ks, ke, metrics, residual, gamma=1.4):
+    xp = xp_from(U0)
     R0 = residual(U0, js, je, ks, ke, metrics, gamma)
     U1 = U0 + dt*R0
     R1 = residual(U1, js, je, ks, ke, metrics, gamma)
     U2 = 0.75*U0 + 0.25*(U1 + dt*R1)
     R2 = residual(U2, js, je, ks, ke, metrics, gamma)
     U3 = (U0 + 2*(U2 + dt*R2)) / 3.0
-    return U3, np.linalg.norm(U3-U0)
+    return U3, xp.linalg.norm(U3-U0)
 
 # -----------------------------
 # Boundary conditions (periodic)
@@ -478,23 +501,24 @@ def apply_periodic(U, ng=3):
 # -----------------------------
 def init_isentropic_vortex(nx, ny, x0=0.0, y0=0.0, Lx=10.0, Ly=10.0, u0=0.5, v0=0, gamma=1.4):
     ng = 3
-    x = np.linspace(-Lx/2, Lx/2, nx)
-    y = np.linspace(-Ly/2, Ly/2, ny)
-    XX, YY = np.meshgrid(x, y, indexing='ij')
+    xp = cp if (cp is not None) else np
+    x = xp.linspace(-Lx/2, Lx/2, nx)
+    y = xp.linspace(-Ly/2, Ly/2, ny)
+    XX, YY = xp.meshgrid(x, y, indexing='ij')
     # make a wavy grid
-    X = XX + 0.1*np.sin(YY)
-    Y = YY + 0.1*np.sin(XX)
+    X = XX + 0.1*xp.sin(YY)
+    Y = YY + 0.1*xp.sin(XX)
     beta = 1.0
         
     r2 = (X-x0)**2 + (Y-y0)**2
-    u = u0 - beta/(2*np.pi)*(Y-y0)*np.exp(0.5*(1-r2))
-    v = v0 + beta/(2*np.pi)*(X-x0)*np.exp(0.5*(1-r2))
-    T = 1.0 - ((gamma-1)*beta**2)/(8*gamma*np.pi**2)*np.exp(1-r2)
+    u = u0 - beta/(2*xp.pi)*(Y-y0)*xp.exp(0.5*(1-r2))
+    v = v0 + beta/(2*xp.pi)*(X-x0)*xp.exp(0.5*(1-r2))
+    T = 1.0 - ((gamma-1)*beta**2)/(8*gamma*xp.pi**2)*xp.exp(1-r2)
     rho = T**(1/(gamma-1))
     p = rho**(gamma)
     E = p/(gamma-1) + 0.5*rho*(u**2 + v**2)
     
-    U = np.zeros((4,nx,ny))
+    U = xp.zeros((4,nx,ny))
     U[0] = rho; U[1] = rho*u; U[2] = rho*v; U[3] = E
     return U, X, Y
 
@@ -506,12 +530,17 @@ def plot_density(XX, YY, U, title='Density'):
     Contour plot of density fjeld
     """
     n,m = XX.shape
-    X = XX[3:n-3,3:m-3]
-    Y = YY[3:n-3,3:m-3]
+    xp = xp_from(XX)
+    if xp!=np:
+      X = xp.asnumpy(XX[3:n-3,3:m-3])
+      Y = xp.asnumpy(YY[3:n-3,3:m-3])
+    else:
+      X = XX[3:n-3,3:m-3]
+      Y = YY[3:n-3,3:m-3]
     rho = U[0][3:n-3,3:m-3]
     plt.figure(figsize=(6,5))
-    cp = plt.contourf(X, Y, rho, levels=50, cmap='viridis')
-    plt.colorbar(cp)
+    ccp = plt.contourf(X, Y, rho, levels=50, cmap='viridis')
+    plt.colorbar(ccp)
     plt.xlabel('x')
     plt.ylabel('y')
     plt.title(title)
@@ -521,14 +550,21 @@ def plot_density(XX, YY, U, title='Density'):
     plt.tight_layout()
 
 def plot_density_line(X, U, Uf, title='Density'):
-    rho = U[0]
-    rhof = Uf[0]
+    xp = xp_from(U)
+    if xp!=np:
+      rho = xp.asnumpy(U[0])
+      rhof = xp.asnumpy(Uf[0])
+      XX = xp.asnumpy(X)
+    else:
+      rho = U[0]
+      rhof= Uf[0]
+      XX = X
     plt.figure(figsize=(6,5))
     n,m = X.shape
     print(n,m)
     print(U.shape)
-    plt.plot(X[:,m//2+1],rho[:,m//2+1],'r.-')
-    plt.plot(X[:,m//2+1],rhof[:,m//2+1],'bo-')
+    plt.plot(XX[:,m//2+1],rho[:,m//2+1],'r.-')
+    plt.plot(XX[:,m//2+1],rhof[:,m//2+1],'bo-')
     plt.show()
     
 # -----------------------------
@@ -550,6 +586,7 @@ def main(restype):
     u0=0.5
     # Initialize
     U, X, Y = init_isentropic_vortex(nx, ny, Lx=Lx, Ly=Ly, u0=u0, gamma=gamma)
+    xp = xp_from(U)
     # find distance to travel to return back to initial location periodically
     # (interior domain size + dx)/u0
     t_final = (X[nx-4,ny//2+1]-X[3,ny//2+1])/u0 + (X[1,ny//2+1]-X[0,ny//2+1])/u0
@@ -563,7 +600,7 @@ def main(restype):
     ks, ke = 3, ny-3
     metrics = compute_metrics(X,Y,js,je,ks,ke)
     dx = (X[1,ny//2+1]-X[0,ny//2+1])
-    print(f' mean_area {np.mean(metrics["area"])} {dx*dx}')
+    print(f' mean_area {xp.mean(metrics["area"])} {dx*dx}')
     #t_final = 0.1
     
     while t < t_final:
@@ -571,8 +608,8 @@ def main(restype):
         # Compute max wave speeds for CFL-based dt
         t += dt
         alpha_x, alpha_y = max_wave_speed(U[:,js:je,ks:ke], gamma)
-        dt_cfl = CFL * min( (X[1,0]-X[0,0])/np.max(alpha_x),
-                            (Y[0,1]-Y[0,0])/np.max(alpha_y) )
+        dt_cfl = CFL * min( (X[1,0]-X[0,0])/xp.max(alpha_x),
+                            (Y[0,1]-Y[0,0])/xp.max(alpha_y) )
         dt = min(dt, t_final-t, dt_cfl)        
         # Advance one time step with RK3-TVD
         U, dUnorm = rk3_tvd(U, dt, js, je, ks, ke, metrics, residual, gamma)
@@ -593,11 +630,11 @@ def errorcheck(restype):
     else:
         compute_metrics = fd_metrics
         residual = residual_fd
-        
+    inc = 1.5
     for p in range(1,max_p+1): 
-        ny =  int(N0 * 1.5**(p-1))+1
-        nx =  2 * int(N0 * 1.5**(p-1))+1
-        Lx, Ly = 20.0, 10.0    # physical domain
+        ny =  int(N0 * inc**(p-1))+1
+        nx =  2 * int(N0 * inc**(p-1))+1
+        Lx, Ly = 20, 10   # physical domain
         CFL = 1.0              # CFL number
         t_final = 1.0         # final time
         gamma = 1.4
@@ -613,12 +650,12 @@ def errorcheck(restype):
         js, je = 3, nx-3
         ks, ke = 3, ny-3
         metrics = compute_metrics(X,Y,js,je,ks,ke)
-        
+        xp = xp_from(U) 
         while t < t_final:
             # Compute max wave speeds for CFL-based dt
             alpha_x, alpha_y = max_wave_speed(U[:,js:je,ks:ke], gamma)
-            dt_cfl = CFL * min( (X[1,0]-X[0,0])/np.max(alpha_x),
-                                (Y[0,1]-Y[0,0])/np.max(alpha_y) )
+            dt_cfl = CFL * min( (X[1,0]-X[0,0])/xp.max(alpha_x),
+                                (Y[0,1]-Y[0,0])/xp.max(alpha_y) )
             dt = min(dt, t_final-t, dt_cfl)
         
             # Advance one time step with RK3-TVD
@@ -628,11 +665,11 @@ def errorcheck(restype):
     
             # Plot final density
             #plot_density(X, Y, U, title=f'Density at t={t_final:.3f}')
-        err = np.sqrt(np.mean(np.square(U[0,js:je,ks:ke]-Uf[0,js:je,ks:ke])))
+        err = xp.sqrt(xp.mean(xp.square(U[0,js:je,ks:ke]-Uf[0,js:je,ks:ke])))
         # Plot final density
         plot_density_line(X, U, Uf, title=f'Density at t={t_final:.3f}')
         if p > 1:
-            print(f"dx: {dx:0.5f} Convergence order: {np.log(errprev/err)/np.log(1.5):.3f}, Error: {err:.3e}")
+            print(f"dx: {dx:0.5f} Convergence order: {xp.log(errprev/err)/xp.log(inc):.3f}, Error: {err:.3e}")
         else:
             print(f"dx: {dx:0.5f} Error: {err:.3e}")
         errprev=err
