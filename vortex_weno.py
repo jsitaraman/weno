@@ -1,7 +1,14 @@
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
+import argparse
 # implement weno5 scheme from Chi-Wang Shu paper
 # https://apps.dtic.mil/sti/tr/pdf/ADA390653.pdf
+#
+# extend for non-uniform curvilinear grids
+# perform checks for isentropic vortex on a wavy grid
+# and ensure 5th order accuracy
+#
 def weno5_fd_2d(F, js, je, axis=1):
     """
     5th-order FD-WENO reconstruction (left/right) for 3D array along given axis.
@@ -95,7 +102,7 @@ def linear_weno_2d(X, js, je, axis=1):
     i = np.arange(js-2, je+1)
     # factors to blend forward and backward weno differences
     # because the first and last point cannot do backward and
-    # and forward with fringe available
+    # and forward with fringe available, FD fluxes need those
     fac_f = np.ones_like(i)*0.5
     fac_b = np.ones_like(i)*0.5
     fac_b[0]=0.0;fac_f[0]=1.0
@@ -120,49 +127,26 @@ def linear_weno_2d(X, js, je, axis=1):
     Xint = np.moveaxis(Xint, 0, axis)
     return Xint
 
-# -----------------------------
-# Flux functions
-# -----------------------------
-def flux_x(U, gamma=1.4):
-    rho = U[0]; u = U[1]/rho; v = U[2]/rho; E = U[3]
-    p = (gamma-1)*(E - 0.5*rho*(u**2 + v**2))
-    F = np.array([rho*u, rho*u**2 + p, rho*u*v, (E+p)*u])
-    return F
-
-def flux_y(U, gamma=1.4):
-    rho = U[0]; u = U[1]/rho; v = U[2]/rho; E = U[3]
-    p = (gamma-1)*(E - 0.5*rho*(u**2 + v**2))
-    G = np.array([rho*v, rho*u*v, rho*v**2 + p, (E+p)*v])
-    return G
-
-def max_wave_speed(U, gamma=1.4):
-    rho = U[0]; u = U[1]/rho; v = U[2]/rho; E = U[3]
-    p = (gamma-1)*(E - 0.5*rho*(u**2 + v**2))
-    c = np.sqrt(gamma*p/rho)
-    return np.max(np.abs(u) + c), np.max(np.abs(v) + c)
-
-def residual_weno2d(U, x, y, js, je, ks, ke, gamma=1.4):
+def fd_metrics(x, y, js, je, ks, ke):
     """
-    Compute 2D WENO5 residual for Euler equations on curvilinear grids.
-    Vectorized and interior-only.
-    
+    Compute Finite Difference metrics at nodes
+
     Parameters
     ----------
-    U : np.ndarray, shape (4, nx, ny)
-        Conserved variables [rho, rho*u, rho*v, E], including ghost cells
-    x, y : np.ndarray, shape (nx, ny)
-        Physical coordinates, including ghost cells
+    x, y : 2D np.ndarray
+        Physical coordinates of the grid nodes.
     js, je, ks, ke : int
-        Interior index ranges
-    gamma : float
-        Ratio of specific heats
-    
+        Start and end indices in j and k directions (Python indexing).
+
     Returns
     -------
-    Res : np.ndarray, shape (4, nx, ny)
-        Residuals at interior cells (ghosts remain 0)
+    xi_x, xi_y : 2D np.ndarray
+        ξ metrics at nodes
+    eta_x, eta_y : 2D np.ndarray
+        η metrics at nodes
+    area : 2D np.ndarray
+        area metrics computed as a Jacobian (not used in residual)
     """
-    Res = np.zeros_like(U)
     n, m = x.shape
     # --- Reconstruct midpoints ---
     xint_xi  = linear_weno_2d(x, js, je, axis=0)
@@ -186,56 +170,273 @@ def residual_weno2d(U, x, y, js, je, ks, ke, gamma=1.4):
     eta_x = -dy_dxi/J
     eta_y = dx_dxi/J
 
-    # --- Loop over conserved variables ---
+    metrics={ "xi_x" : xi_x, "xi_y" :xi_y, "eta_x" : eta_x, "eta_y" :eta_y, "area" : J}
+    return metrics
+
+def fv_metrics(x, y, js, je, ks, ke, check_closure=True):
+    """
+    Compute FV face normals and cell areas on a 2D curvilinear grid.
+
+    Parameters
+    ----------
+    x, y : 2D np.ndarray
+        Physical coordinates of the grid nodes.
+    js, je, ks, ke : int
+        Start and end indices in j and k directions (Python indexing).
+    linear_weno_2d : function
+        Function to compute linear WENO reconstruction along a given axis.
+    check_closure : bool, default=True
+        If True, prints the max deviation from discrete closure.
+
+    Returns
+    -------
+    xi_x, xi_y : 2D np.ndarray
+        ξ-face (East) scaled normals.
+    eta_x, eta_y : 2D np.ndarray
+        η-face (North) scaled normals.
+    area : 2D np.ndarray
+        Cell areas computed consistently with face normals.
+    """
+
+    # --- Step 1: reconstruct corner coordinates ---
+    nx,ny = x.shape
+    x_corner = linear_weno_2d(x, js, je, axis=0)
+    x_corner = linear_weno_2d(x_corner, ks, ke, axis=1)
+    y_corner = linear_weno_2d(y, js, je, axis=0)
+    y_corner = linear_weno_2d(y_corner, ks, ke, axis=1)
+
+    # --- Step 3: compute ξ and η scaled face normals ---
+    xi_x = y_corner[js-1:je, ks:ke] - y_corner[js-1:je, ks-1:ke-1]   # East
+    xi_y = -(x_corner[js-1:je, ks:ke] - x_corner[js-1:je, ks-1:ke-1])
+    eta_x = -(y_corner[js:je, ks-1:ke] - y_corner[js-1:je-1, ks-1:ke])  # North
+    eta_y = (x_corner[js:je, ks-1:ke] - x_corner[js-1:je-1, ks-1:ke])
+
+    # --- Step 4: extract cell corners ---
+    x00 = x_corner[js-1:je-1,ks-1:ke-1]
+    x10 = x_corner[js:je, ks-1:ke-1]
+    x01 = x_corner[js-1:je-1,ks:ke]
+    x11 = x_corner[js:je, ks:ke]
+    y00 = y_corner[js-1:je-1,ks-1:ke-1]
+    y10 = y_corner[js:je, ks-1:ke-1]
+    y01 = y_corner[js-1:je-1,ks:ke]
+    y11 = y_corner[js:je, ks:ke]
+
+
+    # --- Step 5: compute face midpoints ---
+    xS = 0.5*(x00 + x10);  yS = 0.5*(y00 + y10)
+    xE = 0.5*(x10 + x11);  yE = 0.5*(y10 + y11)
+    xN = 0.5*(x11 + x01);  yN = 0.5*(y11 + y01)
+    xW = 0.5*(x01 + x00);  yW = 0.5*(y01 + y00)
+    
+    # debug
+    #ii=nx//2+1
+    #jj=ny//2+1
+    #plt.plot(x[ii,jj],y[ii,jj],'ro')
+    #i1=ii-js
+    #j1=jj-ks
+    #plt.plot([x00[i1,j1],x10[i1,j1]],[y00[i1,j1],y10[i1,j1]],'k')
+    #plt.plot([x10[i1,j1],x11[i1,j1]],[y10[i1,j1],y11[i1,j1]],'k')
+    #plt.plot([x11[i1,j1],x01[i1,j1]],[y11[i1,j1],y01[i1,j1]],'k')
+    #plt.plot([x01[i1,j1],x00[i1,j1]],[y01[i1,j1],y00[i1,j1]],'k')    
+    #plt.gca().quiver(xE[i1,j1],yE[i1,j1],xi_x[i1+1,j1],xi_y[i1+1,j1],scale=5)
+    #plt.gca().quiver(xW[i1,j1],yW[i1,j1],-xi_x[i1,j1],-xi_y[i1,j1],scale=5)
+    #plt.gca().quiver(xN[i1,j1],yN[i1,j1],eta_x[i1,j1+1],eta_y[i1,j1+1],scale=5)
+    #plt.gca().quiver(xS[i1,j1],yS[i1,j1],-eta_x[i1,j1],-eta_y[i1,j1],scale=5)
+    #plt.plot([xE[i1,j1],xE[i1,j1]+xi_x[i1+1,j1]],[yE[i1,j1],yE[i1,j1]+xi_y[i1+1,j1]],'m-')
+    #plt.plot([xW[i1,j1],xW[i1,j1]-xi_x[i1-1,j1]],[yW[i1,j1],yW[i1,j1]-xi_y[i1-1,j1]],'m-')
+    #plt.plot([xW[i1,j1],xW[i1,j1]-xi_x[i1-1,j1]],[yW[i1,j1],yW[i1,j1]-xi_y[i1-1,j1]],'m-')
+    #plt.show()
+    
+    # --- Step 6: compute cell areas via divergence theorem ---
+    area = 0.5 * (
+          xE*xi_x[1:,  :]  + yE*xi_y[1:,   :]   # East
+        - xW*xi_x[:-1, :]  - yW*xi_y[:-1,  :]   # West
+        + xN*eta_x[:, 1:]  + yN*eta_y[:,  1:]   # North
+        - xS*eta_x[:, :-1] - yS*eta_y[:, :-1]   # South
+    )
+
+    # --- Step 7: optional closure check ---
+    if check_closure:
+        # discrete divergence of face normals should be ~0
+        cx = ( xi_x[1:, :] - xi_x[:-1, :] ) + ( eta_x[:, 1:] - eta_x[:, :-1] )
+        cy = ( xi_y[1:, :] - xi_y[:-1, :] ) + ( eta_y[:, 1:] - eta_y[:, :-1] )
+        print("Closure check: max |cx| = {:.3e}, max |cy| = {:.3e}".format(np.max(np.abs(cx)), np.max(np.abs(cy))))
+
+    metrics={ "xi_x" : xi_x, "xi_y" :xi_y, "eta_x" : eta_x, "eta_y" :eta_y, "area" : area}
+    return metrics
+
+# -----------------------------
+# Flux functions
+# -----------------------------
+def flux_x(U, gamma=1.4):
+    rho = U[0]; u = U[1]/rho; v = U[2]/rho; E = U[3]
+    p = (gamma-1)*(E - 0.5*rho*(u**2 + v**2))
+    F = np.array([rho*u, rho*u**2 + p, rho*u*v, (E+p)*u])
+    return F
+
+def flux_y(U, gamma=1.4):
+    rho = U[0]; u = U[1]/rho; v = U[2]/rho; E = U[3]
+    p = (gamma-1)*(E - 0.5*rho*(u**2 + v**2))
+    G = np.array([rho*v, rho*u*v, rho*v**2 + p, (E+p)*v])
+    return G
+
+def max_wave_speed(U, gamma=1.4):
+    rho = U[0]; u = U[1]/rho; v = U[2]/rho; E = U[3]
+    p = (gamma-1)*(E - 0.5*rho*(u**2 + v**2))
+    c = np.sqrt(gamma*p/rho)
+    return np.max(np.abs(u) + c), np.max(np.abs(v) + c)
+
+def interface_wave_speed(UL, UR, n_x, n_y, js, je, ks, ke, gamma=1.4, offx=-1, offy=0):
+    """
+    Compute contravariant Lax-Friedrichs wave speed at interfaces along a given axis.
+    Returns
+    -------
+    alpha : np.ndarray
+        Contravariant wave speed at interfaces in the given slice.
+    """
+    # --- Slice interior interfaces ---
+    rho_avg = 0.5*(UL[0][js+offx:je, ks+offy:ke] + UR[0][js+offx:je, ks+offy:ke])
+    u_avg   = 0.5*(UL[1][js+offx:je, ks+offy:ke] + UR[1][js+offx:je, ks+offy:ke]) / rho_avg
+    v_avg   = 0.5*(UL[2][js+offx:je, ks+offy:ke] + UR[2][js+offx:je, ks+offy:ke]) / rho_avg
+    E_avg   = 0.5*(UL[3][js+offx:je, ks+offy:ke] + UR[3][js+offx:je, ks+offy:ke])
+    # --- Pressure and sound speed ---
+    p_avg = (gamma-1)*(E_avg - 0.5*rho_avg*(u_avg**2 + v_avg**2))
+    c = np.sqrt(gamma*p_avg / rho_avg)
+    # --- Contravariant velocity along interface ---
+    V = u_avg*n_x + v_avg*n_y
+    # --- Metric magnitude ---
+    metric_mag = np.sqrt(n_x**2 + n_y**2)
+    # --- Lax-Friedrichs wave speed ---
+    alpha = np.abs(V) + c*metric_mag
+    return alpha
+
+def reconstruct(U, js, je, gamma=1.4, axis=1):
+    # --- Create Cartesian fluxes
+    F = flux_x(U, gamma)  # x-direction flux
+    G = flux_y(U, gamma)  # y-direction flux    
+    # --- Reconstruct interface fluxes and field values ---
+    FL, FR = weno5_fd_2d(F, js, je, axis=axis)
+    GL, GR = weno5_fd_2d(G, js, je, axis=axis)
+    UL, UR = weno5_fd_2d(U, js,je,axis=axis)
+    
+    return FL, FR, GL, GR, UL, UR
+
+    
+def residual_fv(U, js, je, ks, ke, metrics, gamma=1.4):
+    """
+    Compute 2D WENO5 Finite Volume residual for Euler equations on curvilinear grids.
+    Vectorized and interior-only.
+    
+    Parameters
+    ----------
+    U : np.ndarray, shape (4, nx, ny)
+        Conserved variables [rho, rho*u, rho*v, E], including ghost cells
+    x, y : np.ndarray, shape (nx, ny)
+        Physical coordinates, including ghost cells
+    js, je, ks, ke : int
+        Interior index ranges
+    gamma : float
+        Ratio of specific heats
+    
+    Returns
+    -------
+    Res : np.ndarray, shape (4, nx, ny)
+        Residuals at interior cells (ghosts remain 0)
+    """
+    # init residual
+    Res = np.zeros_like(U)
+
+    # fetch metrics
+    xi_x = metrics["xi_x"]
+    xi_y = metrics["xi_y"]
+    eta_x= metrics["eta_x"]
+    eta_y= metrics["eta_y"]
+    area = metrics["area"]
+
+    # reconstruct j+1/2, k values
+    FL_xi, FR_xi, GL_xi, GR_xi, UL_xi, UR_xi = reconstruct(U, js, je, gamma, axis=1)
+    # wave-speed in contravariant coordinate xi for dissipation scaling
+    alpha_xi=interface_wave_speed(UL_xi, UR_xi, xi_x, xi_y, js, je, ks, ke, offx=-1, offy=0)
+    # FV flux in xi direction
+    F_xi = 0.5*(FL_xi[:,js-1:je,ks:ke] + FR_xi[:,js-1:je,ks:ke])*xi_x + \
+           0.5*(GL_xi[:,js-1:je,ks:ke] + GR_xi[:,js-1:je,ks:ke])*xi_y + \
+           - 0.5*alpha_xi*(UR_xi[:,js-1:je,ks:ke] - UL_xi[:,js-1:je,ks:ke])
+    
+    #reconstruct j, k+1/2 values
+    FL_eta, FR_eta, GL_eta, GR_eta, UL_eta, UR_eta = reconstruct(U, ks, ke, gamma, axis=2)
+    # wave-speed in contravariant coordinate xi for dissipation scaling    
+    alpha_eta = interface_wave_speed(UL_eta, UR_eta, eta_x, eta_y, js, je , ks,ke, offx=0, offy=-1)
+    # FV flux in eta direction
+    F_et = 0.5*(FL_eta[:,js:je,ks-1:ke] + FR_eta[:,js:je,ks-1:ke])*eta_x + \
+           0.5*(GL_eta[:,js:je,ks-1:ke] + GR_eta[:,js:je,ks-1:ke])*eta_y + \
+           -0.5*alpha_eta*(UR_eta[:,js:je,ks-1:ke] - UL_eta[:,js:je,ks-1:ke])
+    # finite volume residual -sum(F.n)/A
+    Res[:, js:je,ks:ke] =  -((F_xi[:,1:,:] - F_xi[:,:-1,:])  \
+                             +(F_et[:,:,1:]- F_et[:,:,:-1]))/area
+    # apply periodicity
+    apply_periodic(Res)
+    return Res
+
+
+def residual_fd(U, js, je, ks, ke, metrics, gamma=1.4):
+    """
+    Compute 2D WENO5 Finite Difference residual for Euler equations on curvilinear grids.
+    Vectorized and interior-only.
+    
+    Parameters
+    ----------
+    U : np.ndarray, shape (4, nx, ny)
+        Conserved variables [rho, rho*u, rho*v, E], including ghost cells
+    x, y : np.ndarray, shape (nx, ny)
+        Physical coordinates, including ghost cells
+    js, je, ks, ke : int
+        Interior index ranges
+    gamma : float
+        Ratio of specific heats
+    
+
+    Returns
+    -------
+    Res : np.ndarray, shape (4, nx, ny)
+        Residuals at interior cells (ghosts remain 0)
+    """
+    Res = np.zeros_like(U)
+    # fetch metrics
+    xi_x = metrics["xi_x"]
+    xi_y = metrics["xi_y"]
+    eta_x= metrics["eta_x"]
+    eta_y= metrics["eta_y"]
+    
+    # --- Create Cartesian Fluxes
     F = flux_x(U, gamma)  # x-direction flux
     G = flux_y(U, gamma)  # y-direction flux
     
-    # --- Reconstruct interface fluxes and field values ---
-    FL_xi, FR_xi = weno5_fd_2d(F, js, je, axis=1)
-    GL_xi, GR_xi = weno5_fd_2d(G, js, je, axis=1)
-    UL_xi, UR_xi = weno5_fd_2d(U, js,je,axis=1)
-    
-    FL_eta, FR_eta = weno5_fd_2d(F, ks, ke, axis=2)
-    GL_eta, GR_eta = weno5_fd_2d(G, ks, ke, axis=2)
-    UL_eta, UR_eta = weno5_fd_2d(U, ks,ke, axis=2)
-    
-    # --- Max wave speed for Lax-Friedrichs type dissipation ---
-    # just arithmetic average now, can change this to Roe average later
-    rho_avg = (UL_xi[0][js-1:je,ks:ke]+UR_xi[0][js-1:je,ks:ke])*0.5
-    u_avg = (UL_xi[1][js-1:je,ks:ke] + UR_xi[1][js-1:je,ks:ke])*0.5 / rho_avg
-    v_avg = (UL_xi[2][js-1:je,ks:ke] + UR_xi[2][js-1:je,ks:ke])*0.5 / rho_avg
-    p_avg = (gamma-1)*( (UL_xi[3][js-1:je,ks:ke]+UR_xi[3][js-1:je,ks:ke])*0.5 - 0.5*rho_avg*(u_avg**2 + v_avg**2) )
-    c = np.sqrt(gamma*p_avg/rho_avg)
-    # these are the metrics at the interface (think of them like a face normal)
+    # reconstruct j+1/2, k values
+    FL_xi, FR_xi, GL_xi, GR_xi, UL_xi, UR_xi = reconstruct(U, js, je, gamma, axis=1)
+    # wave-speed in contravariant coordinate xi for dissipation scaling
     xi_x_avg = (xi_x[:-1,1:-1]+xi_x[1:,1:-1])*0.5
-    xi_y_avg = (xi_y[:-1,1:-1]+xi_y[1:,1:-1])*0.5
-    V_xi = u_avg*xi_x_avg + v_avg*xi_y_avg
-    metric_mag = np.sqrt(xi_x_avg**2 + xi_y_avg**2)
-    # wave-speed in contravariant coordinate for dissipation scaling
-    # divide by xi_x_avg assuming xi is the dominant direction to physical x coord
-    alpha_xi = (np.abs(V_xi) + c*metric_mag)/xi_x_avg    
-
-    # add dissipation term only to xi flux (again assuming xi is dominant along x)
+    xi_y_avg = (xi_y[:-1,1:-1]+xi_y[1:,1:-1])*0.5    
+    alpha_xi=interface_wave_speed(UL_xi, UR_xi, xi_x_avg, xi_y_avg, js, je, ks, ke, offx=-1, offy=0)
+    #divide by xi_x_avg assuming xi is the dominant direction to physical x coord
+    alpha_xi = alpha_xi/xi_x_avg
+    
+    # fd xi flux
+    # add dissipation term only to xi flux (again assuming xi is dominant along x)    
     F_xi = 0.5*(FL_xi[:,js-1:je,ks:ke] + FR_xi[:,js-1:je,ks:ke]) \
         - 0.5*alpha_xi*(UR_xi[:,js-1:je,ks:ke] - UL_xi[:,js-1:je,ks:ke])
 
     G_xi = 0.5*(GL_xi[:,js-1:je,ks:ke] + GR_xi[:,js-1:je,ks:ke]) 
 
-    # wave-speed in contravariant coordinate for dissipation scaling
-    # divide by xi_x_avg assuming xi is the dominant direction to physical x coord
-    rho_avg = (UL_eta[0][js:je,ks-1:ke]+UR_eta[0][js:je,ks-1:ke])*0.5
-    u_avg = (UL_eta[1][js:je,ks-1:ke] + UR_eta[1][js:je,ks-1:ke])*0.5 / rho_avg
-    v_avg = (UL_eta[2][js:je,ks-1:ke] + UR_eta[2][js:je,ks-1:ke])*0.5 / rho_avg
-    p_avg = (gamma-1)*( (UL_eta[3][js:je,ks-1:ke]+UR_eta[3][js:je,ks-1:ke])*0.5 - 0.5*rho_avg*(u_avg**2 + v_avg**2) )
-    c = np.sqrt(gamma*p_avg/rho_avg)
+    # reconstruct j, k+1/2 values
+    FL_eta, FR_eta, GL_eta, GR_eta, UL_eta, UR_eta = reconstruct(U, ks, ke, gamma, axis=2)
+    # wave-speed in contravariant coordinate xi for dissipation scaling
     eta_x_avg = (eta_x[1:-1,:-1]+eta_x[1:-1,1:])*0.5
-    eta_y_avg = (eta_y[1:-1,:-1]+eta_y[1:-1,1:])*0.5
-    V_eta = u_avg*eta_x_avg + v_avg*eta_y_avg
-    metric_mag = np.sqrt(eta_x_avg**2 + eta_y_avg**2)
-    # wave-speed in contravariant coordinate for dissipation scaling
-    # divide by eta_y_avg assuming eta is the dominant direction to physical y coord
-    alpha_eta = (np.abs(V_eta) + c*metric_mag)/eta_y_avg    
+    eta_y_avg = (eta_y[1:-1,:-1]+eta_y[1:-1,1:])*0.5    
+    alpha_eta=interface_wave_speed(UL_eta, UR_eta, eta_x_avg, eta_y_avg, js, je, ks, ke, offx=0, offy=-1)
+    #divide by eta_x_avg assuming eta is the dominant direction to physical y coord
+    alpha_eta = alpha_eta/eta_y_avg
 
+    # fd eta flux
     F_et = 0.5*(FL_eta[:,js:je,ks-1:ke] + FR_eta[:,js:je,ks-1:ke])
     # add dissipation term only to eta flux (again assuming eta is dominant along y)
     G_et = 0.5*(GL_eta[:,js:je,ks-1:ke] + GR_eta[:,js:je,ks-1:ke]) \
@@ -254,13 +455,12 @@ def residual_weno2d(U, x, y, js, je, ks, ke, gamma=1.4):
 # -----------------------------
 # RK3 time integration
 # -----------------------------
-def rk3_tvd(U0, x, y, dt, js, je, ks, ke, gamma=1.4):
-    residual = residual_weno2d
-    R0 = residual(U0, x, y, js, je, ks, ke, gamma)
+def rk3_tvd(U0, dt, js, je, ks, ke, metrics, residual, gamma=1.4):
+    R0 = residual(U0, js, je, ks, ke, metrics, gamma)
     U1 = U0 + dt*R0
-    R1 = residual(U1, x, y, js, je, ks, ke, gamma)
+    R1 = residual(U1, js, je, ks, ke, metrics, gamma)
     U2 = 0.75*U0 + 0.25*(U1 + dt*R1)
-    R2 = residual(U2, x, y, js, je, ks, ke, gamma)
+    R2 = residual(U2, js, je, ks, ke, metrics, gamma)
     U3 = (U0 + 2*(U2 + dt*R2)) / 3.0
     return U3, np.linalg.norm(U3-U0)
 
@@ -334,31 +534,36 @@ def plot_density_line(X, U, Uf, title='Density'):
 # -----------------------------
 # Main routine
 # -----------------------------
-def main():
+def main(restype):
+    # choose appropriate metrics and residual routines
+    if restype == 'fv':
+        compute_metrics = fv_metrics
+        residual = residual_fv
+    else:
+        compute_metrics = fd_metrics
+        residual = residual_fd
     # Grid parameters
     nx, ny = 41, 41        # grid points
     Lx, Ly = 10.0, 10.0    # physical domain
     CFL = 5.0              # CFL number
-    #t_final = 2         # final time
     gamma = 1.4
     u0=0.5
     # Initialize
     U, X, Y = init_isentropic_vortex(nx, ny, Lx=Lx, Ly=Ly, u0=u0, gamma=gamma)
     # find distance to travel to return back to initial location periodically
-    # interior domain size + dx
+    # (interior domain size + dx)/u0
     t_final = (X[nx-4,ny//2+1]-X[3,ny//2+1])/u0 + (X[1,ny//2+1]-X[0,ny//2+1])/u0
     print("t_final=",t_final)
-
-    apply_periodic(U)
-    
     # Plot initial density
-    plot_density(X, Y, U, title='Initial Density')
-    
+    plot_density(X, Y, U, title='Initial Density')    
     # Time stepping loop
     t = 0.0
     dt = 0.1  # initial time step; can compute CFL-based later
     js, je = 3, nx-3
     ks, ke = 3, ny-3
+    metrics = compute_metrics(X,Y,js,je,ks,ke)
+    dx = (X[1,ny//2+1]-X[0,ny//2+1])
+    print(f' mean_area {np.mean(metrics["area"])} {dx*dx}')
     #t_final = 0.1
     
     while t < t_final:
@@ -370,7 +575,7 @@ def main():
                             (Y[0,1]-Y[0,0])/np.max(alpha_y) )
         dt = min(dt, t_final-t, dt_cfl)        
         # Advance one time step with RK3-TVD
-        U, dUnorm = rk3_tvd(U, X, Y, dt, js, je, ks, ke, gamma)
+        U, dUnorm = rk3_tvd(U, dt, js, je, ks, ke, metrics, residual, gamma)
         print(f"time :{t:0.3f} {dUnorm:0.3f}")
     
     # Plot final density
@@ -379,9 +584,16 @@ def main():
 # -----------------------------
 # Main routine for checking error
 # ----------------------------- 
-def errorcheck():
+def errorcheck(restype):
     max_p = 8
     N0 = 10
+    if restype == 'fv':
+        compute_metrics = fv_metrics
+        residual = residual_fv
+    else:
+        compute_metrics = fd_metrics
+        residual = residual_fd
+        
     for p in range(1,max_p+1): 
         ny =  int(N0 * 1.5**(p-1))+1
         nx =  2 * int(N0 * 1.5**(p-1))+1
@@ -400,7 +612,8 @@ def errorcheck():
         dt = 0.1  # initial time step; can compute CFL-based later
         js, je = 3, nx-3
         ks, ke = 3, ny-3
-    
+        metrics = compute_metrics(X,Y,js,je,ks,ke)
+        
         while t < t_final:
             # Compute max wave speeds for CFL-based dt
             alpha_x, alpha_y = max_wave_speed(U[:,js:je,ks:ke], gamma)
@@ -409,7 +622,7 @@ def errorcheck():
             dt = min(dt, t_final-t, dt_cfl)
         
             # Advance one time step with RK3-TVD
-            U, dUnorm = rk3_tvd(U, X, Y, dt, js, je, ks, ke, gamma)
+            U, dUnorm = rk3_tvd(U, dt, js, je, ks, ke, metrics, residual, gamma)
             t += dt
             print(f"time :{t:0.3f} {dUnorm:0.3f}")
     
@@ -423,10 +636,48 @@ def errorcheck():
         else:
             print(f"dx: {dx:0.5f} Error: {err:.3e}")
         errprev=err
+
+def parse_arguments(args):
+    """
+    Parses command line arguments, specifically --value=some_value
+    """
+    parser = argparse.ArgumentParser(description="A simple parser for a --value argument.")
+    
+    # Add the expected argument
+    # 'dest="my_value"' specifies the attribute name in the resulting Namespace object
+    parser.add_argument(
+        '--residual', 
+        dest='residual', 
+        type=str,  # Expect a string value
+        help='A required value for the script, e.g., --residual FV',
+        default = 'FV',
+        required=False # Makes the argument mandatory
+    )
+    parser.add_argument(
+        '--execution', 
+        dest='execution', 
+        type=str,  # Expect a string value
+        help='A required value for the script, e.g., --execution ERRORCHECK',
+        default = 'MAIN',
+        required=False # Makes the argument mandatory
+    )
+
+    # Parse the arguments
+    args = parser.parse_args()
+    
+    # The 'args' object will always have 'args.my_value' defined, 
+    # either from the user input or the default.
+    print(f"Using residual : {args.residual}")
+    print(f"Running        : {args.execution}")
+    
+    return vars(args)
+
 # -----------------------------
 # Run the solver
 # -----------------------------
 if __name__ == "__main__":
-    #main()
-    errorcheck()
-    
+    options = parse_arguments(sys.argv[1:])
+    if options["execution"].lower() == 'main':
+        main(options["residual"].lower())
+    else:
+        errorcheck(options["residual"].lower())
