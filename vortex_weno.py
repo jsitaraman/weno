@@ -534,10 +534,11 @@ def plot_density(XX, YY, U, title='Density'):
     if xp!=np:
       X = xp.asnumpy(XX[3:n-3,3:m-3])
       Y = xp.asnumpy(YY[3:n-3,3:m-3])
+      rho = xp.asnumpy(U[0][3:n-3,3:m-3])
     else:
       X = XX[3:n-3,3:m-3]
       Y = YY[3:n-3,3:m-3]
-    rho = U[0][3:n-3,3:m-3]
+      rho = U[0][3:n-3,3:m-3]
     plt.figure(figsize=(6,5))
     ccp = plt.contourf(X, Y, rho, levels=50, cmap='viridis')
     plt.colorbar(ccp)
