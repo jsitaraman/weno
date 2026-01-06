@@ -1,10 +1,12 @@
 import sys
 import numpy as np
+from matplotlib.animation import FuncAnimation
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 try:
     import cupy as cp
 except ImportError:
     cp = None    
-import matplotlib.pyplot as plt
 import argparse
 # implement weno5 scheme from Chi-Wang Shu paper
 # https://apps.dtic.mil/sti/tr/pdf/ADA390653.pdf
@@ -225,6 +227,13 @@ def fv_metrics(x, y, js, je, ks, ke, check_closure=True):
     xi_y = -(x_corner[js-1:je, ks:ke] - x_corner[js-1:je, ks-1:ke-1])
     eta_x = -(y_corner[js:je, ks-1:ke] - y_corner[js-1:je-1, ks-1:ke])  # North
     eta_y = (x_corner[js:je, ks-1:ke] - x_corner[js-1:je-1, ks-1:ke])
+
+    xi_x[0,:] = xi_x[-1,:]
+    xi_y[0,:] = xi_y[-1,:]
+
+    eta_x[:,0] = eta_x[:,-1]
+    eta_y[:,0] = eta_y[:,-1]
+
 
     # --- Step 4: extract cell corners ---
     x00 = x_corner[js-1:je-1,ks-1:ke-1]
@@ -506,8 +515,8 @@ def init_isentropic_vortex(nx, ny, x0=0.0, y0=0.0, Lx=10.0, Ly=10.0, u0=0.5, v0=
     y = xp.linspace(-Ly/2, Ly/2, ny)
     XX, YY = xp.meshgrid(x, y, indexing='ij')
     # make a wavy grid
-    X = XX + 0.1*xp.sin(YY)
-    Y = YY + 0.1*xp.sin(XX)
+    X = XX + 0.1*xp.sin(2*YY)
+    Y = YY + 0.1*xp.sin(2*XX)
     beta = 1.0
         
     r2 = (X-x0)**2 + (Y-y0)**2
@@ -540,7 +549,7 @@ def plot_density(XX, YY, U, title='Density'):
       Y = YY[3:n-3,3:m-3]
       rho = U[0][3:n-3,3:m-3]
     plt.figure(figsize=(6,5))
-    ccp = plt.contourf(X, Y, rho, levels=50, cmap='viridis')
+    ccp = plt.contour(X, Y, rho, np.linspace(rho.min(),0.9995,20), cmap='viridis')
     plt.colorbar(ccp)
     plt.xlabel('x')
     plt.ylabel('y')
@@ -549,6 +558,48 @@ def plot_density(XX, YY, U, title='Density'):
     plt.plot(X.T,Y.T,'k--',linewidth=0.1)
     plt.axis('equal')
     plt.tight_layout()
+
+# -----------------------------
+# Plotting function
+# -----------------------------
+def plot_density_anim(XX, YY, U, Uf, ax, title='Density',setup=False):
+    """
+    Contour plot of density fjeld
+    """
+    n,m = XX.shape
+    xp = xp_from(XX)
+    if xp!=np:
+      X = xp.asnumpy(XX[3:n-3,3:m-3])
+      Y = xp.asnumpy(YY[3:n-3,3:m-3])
+      rho = xp.asnumpy(U[0][3:n-3,3:m-3])
+      rhof = xp.asnumpy(Uf[0][3:n-3,3:m-3])
+    else:
+      X = XX[3:n-3,3:m-3]
+      Y = YY[3:n-3,3:m-3]
+      rho = U[0][3:n-3,3:m-3]
+      rhof = Uf[0][3:n-3,3:m-3]
+    if setup:
+            ccp = ax[0].contour(X, Y, rho, np.linspace(rho.min(),0.9995,20), cmap='viridis')
+            plt.colorbar(ccp, ax=ax[0], format=ticker.StrMethodFormatter('{x:.3f}'))
+            ax[0].set_xlabel('x')
+            ax[0].set_ylabel('y')
+            ax[0].set_title(title)
+            ax[0].plot(X,Y,'k--',linewidth=0.1)
+            ax[0].plot(X.T,Y.T,'k--',linewidth=0.1)
+            ax[0].set_aspect('equal')
+            ax[0].grid(True)
+            n,m = rho.shape
+            ax[1].set_title('Density at y=0')
+            llp = ax[1].plot(X[:,m//2+1],rho[:,m//2+1],'rd-', X[:,m//2+1],rhof[:,m//2+1],'bo-')
+            ax[1].legend(['Computed','Exact'])
+            ax[1].grid(True)
+            return [ccp,llp]
+    else:
+        ax[0].set_title(title)
+        ccp=ax[0].contour(X, Y, rho, np.linspace(rho.min(),0.9995,20), cmap='viridis')
+        n,m=rho.shape
+        llp = ax[1].plot(X[:,m//2+1],rho[:,m//2+1],'ro', X[:,m//2+1],rhof[:,m//2+1],'b-')
+        return [ccp,llp]
 
 def plot_density_line(X, U, Uf, title='Density'):
     xp = xp_from(U)
@@ -581,43 +632,59 @@ def main(restype):
         residual = residual_fd
     # Grid parameters
     nx, ny = 41, 41        # grid points
-    Lx, Ly = 10.0, 10.0    # physical domain
-    CFL = 5.0              # CFL number
+    dx = 3*np.pi/(nx-6)
+    Lx, Ly = (nx-1)*dx, (ny-1)*dx    # physical domain
+    CFL = 1.0              # CFL number
     gamma = 1.4
     u0=0.5
+    v0=0.0
     # Initialize
     U, X, Y = init_isentropic_vortex(nx, ny, Lx=Lx, Ly=Ly, u0=u0, gamma=gamma)
     xp = xp_from(U)
     # find distance to travel to return back to initial location periodically
     # (interior domain size + dx)/u0
-    t_final = (X[nx-4,ny//2+1]-X[3,ny//2+1])/u0 + (X[1,ny//2+1]-X[0,ny//2+1])/u0
+    umag = np.sqrt(u0**2+v0**2)
+    Ldist = (X[nx-4,ny//2+1]-X[3,ny//2+1]) + (X[1,ny//2+1]-X[0,ny//2+1])
+    t_final = Ldist/umag
     print("t_final=",t_final)
-    # Plot initial density
-    plot_density(X, Y, U, title='Initial Density')    
+
+    fig,ax=plt.subplots(1,2, figsize=(11, 4.25))
+    artist=plot_density_anim(X, Y, U, U, ax, title='Initial Density',setup=True)    
+
     # Time stepping loop
     t = 0.0
-    dt = 0.1  # initial time step; can compute CFL-based later
+    dt = 0.05  # initial time step; can compute CFL-based later
     js, je = 3, nx-3
     ks, ke = 3, ny-3
     metrics = compute_metrics(X,Y,js,je,ks,ke)
     dx = (X[1,ny//2+1]-X[0,ny//2+1])
     print(f' mean_area {xp.mean(metrics["area"])} {dx*dx}')
-    #t_final = 0.1
     
-    while t < t_final:
+    def update(frame):
+        nonlocal t, dt, U, artist, Ldist
         # Apply periodic BCs
         # Compute max wave speeds for CFL-based dt
-        t += dt
+        if abs(t-t_final) < 1e-10:
+           return []
         alpha_x, alpha_y = max_wave_speed(U[:,js:je,ks:ke], gamma)
         dt_cfl = CFL * min( (X[1,0]-X[0,0])/xp.max(alpha_x),
                             (Y[0,1]-Y[0,0])/xp.max(alpha_y) )
         dt = min(dt, t_final-t, dt_cfl)        
+        t += dt
         # Advance one time step with RK3-TVD
         U, dUnorm = rk3_tvd(U, dt, js, je, ks, ke, metrics, residual, gamma)
         print(f"time :{t:0.3f} {dUnorm:0.3f}")
-    
+        artist[0].remove()
+        artist[1][0].remove()
+        artist[1][1].remove()
+        vpos=u0*t
+        if vpos > Ldist*0.5:
+            vpos-=Ldist
+        Uf, Xf, Yf = init_isentropic_vortex(nx, ny, Lx=Lx, Ly=Ly, x0=vpos, u0=u0, gamma=gamma)
+        artist=plot_density_anim(X, Y, U, Uf, ax, title=f'Density at t={t:.3f}',setup=False)    
+        return []
+    anim=FuncAnimation(fig,update,interval=1,cache_frame_data=False)
     # Plot final density
-    plot_density(X, Y, U, title=f'Density at t={t_final:.3f}')
     plt.show()
 # -----------------------------
 # Main routine for checking error
